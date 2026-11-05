@@ -1,5 +1,7 @@
 # Mapart Feeder · 地图画自动供料
 
+[![build](https://github.com/CNGM222/mapart-feeder/actions/workflows/build.yml/badge.svg?branch=1.21.11%2BFabric)](https://github.com/CNGM222/mapart-feeder/actions/workflows/build.yml)
+
 Minecraft Java **1.21.11 / Fabric** 纯客户端 mod。配合 **Litematica** 与 **投影打印机**（litematica-printer）使用：
 
 - 你只负责登记原料容器、指定地图画中心；
