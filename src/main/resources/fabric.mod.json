@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "id": "mapartfeeder",
+  "version": "${version}",
+  "name": "Mapart Feeder",
+  "description": "客户端地图画供料：按 Litematica 材料缺口从登记容器自动取料，走到地图画区域扫层，让投影打印机放置；背包空时回中心刷新清单。",
+  "authors": [
+    "taskwork"
+  ],
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "dev.mapartfeeder.MapartFeederClient"
+    ]
+  },
+  "mixins": [
+    "mapartfeeder.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.16.10",
+    "minecraft": "1.21.11",
+    "java": ">=21",
+    "fabric-api": "*"
+  },
+  "suggests": {
+    "litematica": "*",
+    "malilib": "*"
+  }
+}

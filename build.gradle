@@ -1,0 +1,57 @@
+plugins {
+    id 'fabric-loom' version "${loom_version}"
+}
+
+version = project.mod_version
+group = project.group
+
+base {
+    archivesName = project.archives_base_name
+}
+
+repositories {
+    mavenCentral()
+    // 本机调试时可把 litematica / malilib / litematica-printer 的 jar 放进 libs/ 供 IDE 补全；
+    // 运行期代码只通过反射访问它们，编译不依赖这三个 jar。
+    flatDir { dirs 'libs' }
+}
+
+loom {
+    // 纯客户端 mod：只依赖客户端 jar 编译，不需要服务端 jar（离线环境尤其重要）。
+    clientOnlyMinecraftJar()
+
+    // Client-only mod: a single merged source set keeps the offline build simple.
+    mods {
+        "mapartfeeder" {
+            sourceSet sourceSets.main
+        }
+    }
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+
+    // 仅编译期参考，不打进 jar。
+    compileOnly fileTree(dir: 'libs', include: ['*.jar'])
+}
+
+processResources {
+    inputs.property 'version', project.version
+    filesMatching('fabric.mod.json') {
+        expand 'version': project.version
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = 21
+    options.encoding = 'UTF-8'
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+    withSourcesJar()
+}
