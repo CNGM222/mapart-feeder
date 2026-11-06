@@ -26,8 +26,8 @@ public final class FeederConfig {
     /** 打印阶段自动把投影打印机打开，离开打印阶段恢复用户原来的开关。 */
     public boolean autoTogglePrinter = true;
 
-    /** 蛇形扫层的车道间距（格）。打印机交互距离约 4.5 格，6 格能覆盖整层。 */
-    public int printLaneSpacing = 6;
+    /** 打印阶段每次接近一个未放置方块后，停留多少个 tick 让打印机放置。 */
+    public int printWaitTicks = 15;
 
     /** 中心点未填时使用的地图画半径；128×128 的半边长是 64。 */
     public int printAreaHalfSize = 64;
@@ -89,8 +89,8 @@ public final class FeederConfig {
     }
 
     private void validate() {
-        printLaneSpacing = clamp(printLaneSpacing, 2, 16);
         printAreaHalfSize = clamp(printAreaHalfSize, 1, 256);
+        printWaitTicks = clamp(printWaitTicks, 0, 100);
         materialCheckIntervalTicks = clamp(materialCheckIntervalTicks, 5, 200);
         openTimeoutTicks = clamp(openTimeoutTicks, 10, 200);
         syncTimeoutTicks = clamp(syncTimeoutTicks, 20, 400);

@@ -1,5 +1,9 @@
 package dev.mapartfeeder.integration;
 
+import net.minecraft.block.BlockState;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.world.BlockView;
+
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
@@ -50,6 +54,8 @@ public final class LitematicaBridge {
     private final ClassLoader loader;
     private volatile Api cached;
     private volatile BridgeException failure;
+    private Method schematicWorldMethod;
+    private boolean schematicWorldResolved;
 
     public LitematicaBridge() {
         this(LitematicaBridge.class.getClassLoader());
@@ -58,6 +64,40 @@ public final class LitematicaBridge {
     public LitematicaBridge(ClassLoader loader) {
         if (loader == null) throw new BridgeException("Litematica 集成初始化失败：类加载器为空");
         this.loader = loader;
+    }
+
+    /** 投影的结构世界；没有选中投影或未加载时为 null。 */
+    public Object schematicWorld() {
+        if (!schematicWorldResolved) {
+            schematicWorldResolved = true;
+            try {
+                Class<?> handler = Class.forName(PREFIX + "world.SchematicWorldHandler",
+                        false, loader);
+                Method method = handler.getMethod("getSchematicWorld");
+                if (Modifier.isStatic(method.getModifiers())) schematicWorldMethod = method;
+            } catch (NoSuchMethodException | ClassNotFoundException | LinkageError e) {
+                schematicWorldMethod = null;
+            }
+        }
+        if (schematicWorldMethod == null) return null;
+        try {
+            return schematicWorldMethod.invoke(null);
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            return null;
+        }
+    }
+
+    /**
+     * 直接读取结构世界里的方块状态。返回的是本进程内的 BlockState 实例，可以
+     * 与真实世界状态按引用比较；结构世界不可用或类型不符时返回 null。
+     */
+    public BlockState stateInSchematic(Object schematicWorld, BlockPos pos) {
+        if (!(schematicWorld instanceof BlockView view)) return null;
+        try {
+            return view.getBlockState(pos);
+        } catch (RuntimeException e) {
+            return null;
+        }
     }
 
     /** Null when no placement is selected; never creates a list for an unselected placement. */

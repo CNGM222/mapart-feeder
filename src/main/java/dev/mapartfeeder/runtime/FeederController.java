@@ -10,10 +10,13 @@ import dev.mapartfeeder.logic.TransferPlanner;
 import dev.mapartfeeder.nav.Nav;
 import dev.mapartfeeder.nav.Walker;
 import it.unimi.dsi.fastutil.ints.Int2ObjectMaps;
+import net.minecraft.block.BlockState;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.Screen;
 import net.minecraft.client.gui.screen.ingame.HandledScreen;
+import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
+import net.minecraft.item.Items;
 import net.minecraft.network.packet.c2s.play.ClickSlotC2SPacket;
 import net.minecraft.screen.GenericContainerScreenHandler;
 import net.minecraft.screen.ScreenHandler;
@@ -39,10 +42,13 @@ import java.util.Map;
  * <ol>
  *   <li>读取当前 Litematica 投影的材料缺口；</li>
  *   <li>按缺口走到登记过的原料容器，用原版快速拿取补货；</li>
- *   <li>补到背包满 / 缺口补齐后，走到地图画区域，蛇形扫层让投影打印机放置；</li>
- *   <li>背包里对打印有用的原料用完，走到地图画中心，请求刷新材料清单；</li>
- *   <li>再取料再打印，直到清单没有缺口，停在中心。</li>
+ *   <li>带着原料走到地图画区域，只朝“背包里有的、还没放置的方块”逐个移动，
+ *       让投影打印机在交互距离内放置，而不是机械地扫整层；</li>
+ *   <li>背包里能用的原料耗尽后，回到地图画中心（结构完整加载的位置）请求重新统计；</li>
+ *   <li>再取料再打印，全自动循环，直到清单没有缺口，停在中心。</li>
  * </ol>
+ *
+ * <p>材料统计只在地图画中心请求：在原料容器旁边统计会因为结构未加载而得到错误数量。</p>
  *
  * <p>只使用原版交互：真实走路、真实开箱、真实 QUICK_MOVE 点击；不写世界、
  * 不发自造包、不改变服务端权限。</p>
@@ -50,7 +56,7 @@ import java.util.Map;
 public final class FeederController {
     private enum Phase {
         IDLE, ANALYZE, TO_CONTAINER, OPENING, TRANSFER, SYNCING,
-        TO_PRINT, TO_CENTER, RECOUNT, DONE
+        TO_AREA, TO_PRINT, TO_CENTER, RECOUNT, DONE
     }
 
     private static final int MAX_CLICKS_PER_TICK = 128;
@@ -87,17 +93,19 @@ public final class FeederController {
     private int clicksThisTick;
 
     private final List<ItemStack> skipped = new ArrayList<>();
-    private final List<BlockPos> sweep = new ArrayList<>();
-    private int sweepIndex;
+    /** 当前扫描到的、背包里有对应物品且尚未放置的方块。 */
+    private final List<BlockPos> targets = new ArrayList<>();
+    private final Map<BlockPos, Integer> targetAttempts = new HashMap<>();
+    private BlockPos currentTarget;
+    private long nextTargetScan;
+    private int printWaitTicks;
     private long missingBeforePrint = -1;
     private int noProgressCycles;
+    private int areaFailures;
 
     private boolean recountRequested;
     private long recountBaseline;
     private long recountDeadline;
-
-    private boolean countRequested;
-    private long countDeadline;
 
     private PrinterBridge.Snapshot printerSnapshot;
     private boolean printerManaged;
@@ -146,8 +154,9 @@ public final class FeederController {
         tick = 0;
         nextThink = 0;
         skipped.clear();
-        sweep.clear();
-        sweepIndex = 0;
+        targets.clear();
+        targetAttempts.clear();
+        currentTarget = null;
         noProgressCycles = 0;
         missingBeforePrint = -1;
         recountRequested = false;
@@ -189,8 +198,9 @@ public final class FeederController {
         context = null;
         catalog.clear();
         cooldowns.clear();
-        sweep.clear();
-        sweepIndex = 0;
+        targets.clear();
+        targetAttempts.clear();
+        currentTarget = null;
         skipped.clear();
         taken.clear();
         printerManaged = false;
@@ -262,8 +272,9 @@ public final class FeederController {
         }
         config.center = ContainerRef.of(client.world.getRegistryKey(), pos);
         config.save();
-        sweep.clear();
-        sweepIndex = 0;
+        targets.clear();
+        targetAttempts.clear();
+        currentTarget = null;
         notice("地图画中心已设为 " + config.center.shortText());
     }
 
@@ -345,6 +356,7 @@ public final class FeederController {
             case OPENING -> waitForOpen();
             case TRANSFER -> transfer();
             case SYNCING -> waitForSync();
+            case TO_AREA -> travelToArea();
             case TO_PRINT -> travelToPrint();
             case TO_CENTER -> travelToCenter();
             case RECOUNT -> recount();
@@ -393,14 +405,25 @@ public final class FeederController {
                 || context.materialList() != selected.materialList()) {
             context = selected;
             skipped.clear();
-            sweep.clear();
-            sweepIndex = 0;
+            targets.clear();
+            targetAttempts.clear();
+            currentTarget = null;
             noProgressCycles = 0;
         }
         disablePrinterForTravel();
 
-        // 第一次接触这个材料清单时，先让它真正统计一次，否则 getCountMissing 全是 0。
-        if (!ensureMaterialCounted()) return;
+        // 材料统计只在中心做：在原料容器旁边统计时，地图画结构没有完整加载，数量会错。
+        if (MaterialGenerationTracker.generation(context.materialList()) <= 0) {
+            if (atCenter()) {
+                phase = Phase.RECOUNT;
+                recountRequested = false;
+                status = "在中心统计材料清单";
+            } else {
+                phase = Phase.TO_AREA;
+                status = "先去地图画中心，再统计材料";
+            }
+            return;
+        }
 
         List<LitematicaBridge.Need> needs = bridge.needs(context, client.player);
         long missing = missingTotal(needs);
@@ -453,44 +476,22 @@ public final class FeederController {
         status = "前往原料容器 " + next.shortText();
     }
 
-    private boolean ensureMaterialCounted() {
-        long generation = MaterialGenerationTracker.generation(context.materialList());
-        if (generation > 0) {
-            countRequested = false;
-            return true;
-        }
-        if (!countRequested) {
-            bridge.requestRecount(context);
-            countDeadline = tick + config.recountTimeoutTicks;
-            countRequested = true;
-            status = "正在统计投影材料清单…";
-            return false;
-        }
-        generation = MaterialGenerationTracker.generation(context.materialList());
-        if (generation > 0) {
-            countRequested = false;
-            return true;
-        }
-        if (tick > countDeadline) {
-            countDeadline = tick + config.recountTimeoutTicks;
-            bridge.requestRecount(context);
-            status = "材料清单尚未统计完成：可在 Litematica 里手动刷新一次";
-        }
-        return false;
-    }
-
     private void beginPrint(long missing) {
         if (!printer.isAvailable()) {
             finish("未检测到投影打印机，无法开始打印");
             return;
         }
-        if (sweep.isEmpty()) buildSweep();
-        if (sweep.isEmpty()) {
-            finish("打印区域为空，请检查地图画中心");
+        if (bridge.schematicWorld() == null) {
+            finish("读取不到投影的结构数据：请先选中投影并让它正常渲染");
             return;
         }
         missingBeforePrint = missing;
         recountRequested = false;
+        currentTarget = null;
+        targets.clear();
+        targetAttempts.clear();
+        nextTargetScan = tick;
+        printWaitTicks = 0;
         InteractionGate.setBusy(false);
         phase = Phase.TO_PRINT;
         status = "原料就绪，前往地图画";
@@ -926,36 +927,177 @@ public final class FeederController {
 
     // ------------------------------------------------------------------ 打印
 
+    /**
+     * 打印阶段：只走向“背包里有对应物品、且结构里还没放置”的方块。
+     * 打印机在交互距离内自动放置，所以到目标附近停留一会儿再重新扫描；
+     * 已经放好的方块会从目标里消失，不再机械地扫整层。
+     */
     private void travelToPrint() {
         if (!printer.isAvailable()) {
             finish("未检测到投影打印机，无法开始打印");
             return;
         }
         InteractionGate.setBusy(false);
-        enablePrinter();
-        if (sweepIndex >= sweep.size()) {
-            phase = Phase.TO_CENTER;
-            status = "本层扫完，回中心刷新材料清单";
+        // 打印机可能被它自己的自动关闭逻辑关掉，打印阶段持续校正。
+        if (tick % 20 == 0 && !printer.isPrintEnabled()) enablePrinter();
+
+        if (printWaitTicks > 0) {
+            printWaitTicks--;
+            if (printWaitTicks == 0) {
+                if (currentTarget != null && stillMissing(currentTarget)) {
+                    // 站了一会儿仍然没放上：记一次失败，换下一个目标，稍后还会回来。
+                    targetAttempts.merge(currentTarget, 1, Integer::sum);
+                }
+                currentTarget = null;
+                nextTargetScan = tick;
+            }
             return;
         }
-        if (tick % 20 == 0 && !hasUsefulMaterial()) {
-            phase = Phase.TO_CENTER;
-            status = "背包里没有可用的原料，回中心刷新";
+
+        if (tick >= nextTargetScan) {
+            nextTargetScan = tick + 20;
+            scanTargets();
+            if (currentTarget != null && !stillMissing(currentTarget)) currentTarget = null;
+            if (targets.isEmpty()) {
+                afterTargetsExhausted();
+                return;
+            }
+            if (currentTarget == null) currentTarget = chooseTarget();
+            if (currentTarget == null) {
+                afterTargetsExhausted();
+                return;
+            }
+        }
+
+        if (currentTarget == null) {
+            afterTargetsExhausted();
             return;
         }
-        BlockPos waypoint = sweep.get(sweepIndex);
-        Nav.PointGoal goal = new Nav.PointGoal(waypoint.getX(), waypoint.getZ(),
-                waypoint.getY() - 2, waypoint.getY() + 3, 1.5);
+        if (!stillMissing(currentTarget)) {
+            currentTarget = null;
+            nextTargetScan = tick;
+            return;
+        }
+
+        // 站在离目标约两格的位置，避免直接站在待放置方块上导致打印机放不进去；
+        // 第一次走不到时再改成直接走到方块坐标。
+        int attempts = targetAttempts.getOrDefault(currentTarget, 0);
+        int offset = attempts == 0 ? 2 : 0;
+        int dx = Integer.compare(client.player.getBlockX(), currentTarget.getX());
+        int dz = Integer.compare(client.player.getBlockZ(), currentTarget.getZ());
+        if (dx == 0 && dz == 0) dx = 1;
+        int goalX = currentTarget.getX() + dx * offset;
+        int goalZ = currentTarget.getZ() + dz * offset;
+        Nav.PointGoal goal = new Nav.PointGoal(goalX, goalZ,
+                config.center.y - 2, config.center.y + 3, offset == 0 ? 1.2 : 1.0);
         Walker.Result result = walker.tick(client, goal);
         if (result == Walker.Result.ARRIVED) {
-            sweepIndex++;
-            status = "打印中：" + sweepIndex + " / " + sweep.size();
+            printWaitTicks = config.printWaitTicks;
+            status = "等待打印机放置 " + currentTarget.toShortString();
         } else if (result == Walker.Result.FAILED) {
-            sweepIndex++;
-            status = "该点走不到，跳过；（" + sweepIndex + " / " + sweep.size() + "）";
+            targetAttempts.merge(currentTarget, 1, Integer::sum);
+            currentTarget = null;
+            nextTargetScan = tick;
+            status = "这个打印点走不到，换下一个";
         } else {
-            status = "前往打印点（" + sweepIndex + " / " + sweep.size() + "）";
+            status = "前往未放置方块 " + currentTarget.toShortString();
         }
+    }
+
+    /** 只走到中心，不触发材料统计；用于结构区块未加载、需要靠近后再扫描的情况。 */
+    private void travelToArea() {
+        InteractionGate.setBusy(false);
+        if (config.center == null) {
+            phase = Phase.ANALYZE;
+            return;
+        }
+        Nav.PointGoal goal = new Nav.PointGoal(config.center.x, config.center.z,
+                config.center.y - 2, config.center.y + 4, 1.5);
+        Walker.Result result = walker.tick(client, goal);
+        if (result == Walker.Result.RUNNING) {
+            status = "前往地图画中心";
+            return;
+        }
+        if (result == Walker.Result.FAILED && ++areaFailures >= 3) {
+            finish("走不到地图画中心，无法继续统计与打印");
+            return;
+        }
+        if (result == Walker.Result.ARRIVED) areaFailures = 0;
+        phase = Phase.ANALYZE;
+    }
+
+    /** 扫描地图画区域，收集“结构要求、现实没有、背包里还有”的方块位置。 */
+    private void scanTargets() {
+        targets.clear();
+        Object schematic = bridge.schematicWorld();
+        if (schematic == null || config.center == null) return;
+        int half = config.printAreaHalfSize;
+        int minX = config.center.x - half;
+        int maxX = config.center.x + half - 1;
+        int minZ = config.center.z - half;
+        int maxZ = config.center.z + half - 1;
+        int y = config.center.y;
+        BlockPos.Mutable cursor = new BlockPos.Mutable();
+        for (int x = minX; x <= maxX; x++) {
+            for (int z = minZ; z <= maxZ; z++) {
+                cursor.set(x, y, z);
+                BlockState required = bridge.stateInSchematic(schematic, cursor);
+                if (required == null || required.isAir()) continue;
+                if (required == client.world.getBlockState(cursor)) continue;
+                Item item = required.getBlock().asItem();
+                if (item == Items.AIR) continue;
+                if (InventorySlots.countDirect(client.player, new ItemStack(item)) <= 0) continue;
+                targets.add(new BlockPos(x, y, z));
+            }
+        }
+    }
+
+    private BlockPos chooseTarget() {
+        BlockPos best = null;
+        double bestDistance = Double.MAX_VALUE;
+        Vec3d feet = client.player.getEntityPos();
+        for (BlockPos pos : targets) {
+            int attempts = targetAttempts.getOrDefault(pos, 0);
+            if (attempts >= 3) continue;
+            if (pos.equals(client.player.getBlockPos())) continue;
+            double distance = feet.squaredDistanceTo(Vec3d.ofCenter(pos));
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                best = pos;
+            }
+        }
+        return best;
+    }
+
+    private boolean stillMissing(BlockPos pos) {
+        Object schematic = bridge.schematicWorld();
+        if (schematic == null) return false;
+        BlockState required = bridge.stateInSchematic(schematic, pos);
+        if (required == null || required.isAir()) return false;
+        return required != client.world.getBlockState(pos);
+    }
+
+    /** 当前范围内已经没有“能放置”的目标：判断是缺料还是结构没加载。 */
+    private void afterTargetsExhausted() {
+        List<LitematicaBridge.Need> needs = bridge.needs(context, client.player);
+        long missing = missingTotal(needs);
+        if (missing == 0) {
+            phase = Phase.TO_CENTER;
+            status = "没有剩余方块，回中心确认";
+            return;
+        }
+        if (hasUsefulMaterial()) {
+            if (atCenter()) {
+                phase = Phase.TO_CENTER;
+                status = "中心也没有可放置目标，重新统计材料";
+            } else {
+                phase = Phase.TO_AREA;
+                status = "回到中心继续寻找未放置方块";
+            }
+            return;
+        }
+        phase = Phase.TO_CENTER;
+        status = "背包原料用完，回中心刷新清单";
     }
 
     private void travelToCenter() {
@@ -1011,6 +1153,10 @@ public final class FeederController {
             finish("没有更多可打印的进度，停止在中心（剩余 " + missing + " 块）" + extra);
             return;
         }
+        targets.clear();
+        targetAttempts.clear();
+        currentTarget = null;
+        nextTargetScan = tick;
         phase = Phase.ANALYZE;
         nextThink = tick + 2;
         status = "重新分析材料缺口";
@@ -1035,31 +1181,6 @@ public final class FeederController {
         double dx = client.player.getX() - (config.center.x + 0.5);
         double dz = client.player.getZ() - (config.center.z + 0.5);
         return dx * dx + dz * dz <= 4.0 && Math.abs(client.player.getY() - config.center.y) <= 4;
-    }
-
-    private void buildSweep() {
-        sweep.clear();
-        sweepIndex = 0;
-        if (config.center == null) return;
-        int half = config.printAreaHalfSize;
-        int minX = config.center.x - half;
-        int maxX = config.center.x + half - 1;
-        int minZ = config.center.z - half;
-        int maxZ = config.center.z + half - 1;
-        int y = config.center.y;
-        int lane = Math.max(2, config.printLaneSpacing);
-        boolean leftToRight = true;
-        for (int z = minZ; z <= maxZ; z += lane) {
-            int start = leftToRight ? minX : maxX;
-            int end = leftToRight ? maxX : minX;
-            sweep.add(new BlockPos(start, y, z));
-            int step = leftToRight ? 8 : -8;
-            for (int x = start + step; (step > 0 ? x < end : x > end); x += step) {
-                sweep.add(new BlockPos(x, y, z));
-            }
-            if (start != end) sweep.add(new BlockPos(end, y, z));
-            leftToRight = !leftToRight;
-        }
     }
 
     // ------------------------------------------------------------------ 打印机
