@@ -128,3 +128,7 @@ build.cmd build
 - 打印机的开关与刷新通过反射访问：原版 `Configs.PRINT_MODE`，或 BiliXWhite 分支的 `Configs.Core.WORK_SWITCH` / `Configs.Print.ENABLED` 与 `MissingMaterialTracker`；
 - 所有交互都走原版：真实走路、真实右键开箱、真实 `clickSlot`，不发送自造数据包、不直接改世界。
 
+## License
+
+MIT License，见 [LICENSE](LICENSE)。
+
