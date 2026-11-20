@@ -26,6 +26,9 @@ public final class FeederConfig {
     /** 打印阶段自动把投影打印机打开，离开打印阶段恢复用户原来的开关。 */
     public boolean autoTogglePrinter = true;
 
+    /** 平滑走位：沿拉直的折线做前视点追踪，拐角走圆弧；个别狭窄地形卡住时可关掉。 */
+    public boolean smoothWalking = true;
+
     /** 打印阶段每次接近一个未放置方块后，停留多少个 tick 让打印机放置。 */
     public int printWaitTicks = 15;
 
@@ -62,6 +65,7 @@ public final class FeederConfig {
                 if (config == null) throw new IllegalArgumentException("配置文件内容为空");
                 if (!tree.has("unobtrusiveInteraction")) config.unobtrusiveInteraction = true;
                 if (!tree.has("autoTogglePrinter")) config.autoTogglePrinter = true;
+                if (!tree.has("smoothWalking")) config.smoothWalking = true;
                 config.validate();
                 return config;
             } catch (IOException | RuntimeException e) {

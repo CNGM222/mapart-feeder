@@ -73,6 +73,13 @@ Minecraft Java **1.21.11 / Fabric** 纯客户端 mod。配合 **Litematica** 与
 - 清单没有缺口 → 完成并停在中心。
 - 连续两次刷新后剩余方块数没有减少，且已无法再取到原料 → 停止并提示“剩余方块可能无法放置”（常见原因：被遮挡、缺支撑、区域不在交互距离、打印机没有真正开启）。
 
+### 怎么走
+
+- 寻路允许斜着走，并会把 A* 的格子路径拉直成几条长直线，只保留真正的拐点；随后按约 0.45 格间距重采样成密集路点。
+- 走位用前视点追踪：始终看向路径前方约 1.2 格处的点，每 tick 只转 16°（角度差很大时 30°），所以拐角是圆弧而不是直角折线。
+- 每 120 tick 才重算一次路线，减少频繁重算带来的方向抖动；切换目标时会立刻丢掉旧路线，不会继续朝上一个目标走。
+- 前方要上台阶时才起跳；真的卡住会先起跳、再横向蹭一下，仍不动才重算路线。
+
 ### 自动继续
 
 一轮打印结束、材料耗尽、回到中心刷新之后，会自动继续取料并回到打印区域；只有按 **F8** 才会停止。打印机如果被它自己的自动关闭逻辑关掉，打印阶段会每 20 tick 检查并重新打开。
@@ -85,6 +92,7 @@ Minecraft Java **1.21.11 / Fabric** 纯客户端 mod。配合 **Litematica** 与
 | --- | ---: | --- |
 | `unobtrusiveInteraction` | `true` | 无感开箱：只在本机隐藏自动打开的容器界面，服务端仍是正常开箱 |
 | `autoTogglePrinter` | `true` | 打印阶段自动打开打印机，停止时恢复原开关 |
+| `smoothWalking` | `true` | 平滑走位；个别很窄的通道因为拐弯半径过大卡住时，可改为 `false` 恢复每 tick 直接对准方向 |
 | `printAreaHalfSize` | `64` | 打印区域半边长；128×128 地图画用 64 |
 | `printWaitTicks` | `15` | 走到一个未放置方块旁边后，停留多少 tick 让打印机放置 |
 | `materialCheckIntervalTicks` | `20` | 打印中检查“原料是否用完”的间隔 |
@@ -118,7 +126,7 @@ build.cmd build
 
 首次构建需要 JDK 21 与网络（Gradle Wrapper 会下载 Gradle 和依赖）。仓库同时提交了 Gradle Wrapper，GitHub Actions 会用它构建；本地没有网络时可以用会话里预置的 Gradle 发行包配合 `clientOnlyMinecraftJar()` 离线编译（见 `build.gradle`）。
 
-产物：`build/libs/mapart-feeder-0.2.0.jar`（不要放 `-sources.jar`）。
+产物：`build/libs/mapart-feeder-0.2.1.jar`（不要放 `-sources.jar`）。
 
 ## 实现说明
 

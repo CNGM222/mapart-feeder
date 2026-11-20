@@ -123,6 +123,7 @@ public final class FeederController {
     public FeederController(MinecraftClient client, FeederConfig config) {
         this.client = client;
         this.config = config;
+        this.walker.setSmoothTurning(config.smoothWalking);
     }
 
     // ------------------------------------------------------------------ 用户操作
