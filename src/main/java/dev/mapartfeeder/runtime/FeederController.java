@@ -62,6 +62,10 @@ public final class FeederController {
     private static final int MAX_CLICKS_PER_TICK = 128;
     /** 目标走不到或停留后仍未放上时，至少隔这么久再试。 */
     private static final long TARGET_RETRY_COOLDOWN_TICKS = 200;
+    /** 连续多少轮“剩余方块数没有减少”才判定没有进展。 */
+    private static final int NO_PROGRESS_LIMIT = 4;
+    /** 没进展时给打印机的额外停留时间上限（tick）。 */
+    private static final int MAX_WAIT_BONUS = 60;
 
     private final MinecraftClient client;
     private final FeederConfig config;
@@ -107,6 +111,8 @@ public final class FeederController {
     private int printWaitTicks;
     private long missingBeforePrint = -1;
     private int noProgressCycles;
+    private int waitBonus;
+    private int idleTargetScans;
     private int areaFailures;
 
     private boolean recountRequested;
@@ -167,6 +173,8 @@ public final class FeederController {
         targetCooldowns.clear();
         currentTarget = null;
         noProgressCycles = 0;
+        waitBonus = 0;
+        idleTargetScans = 0;
         missingBeforePrint = -1;
         recountRequested = false;
         printerManaged = false;
@@ -507,6 +515,7 @@ public final class FeederController {
         targetAttempts.clear();
         targetGoals.clear();
         targetCooldowns.clear();
+        idleTargetScans = 0;
         nextTargetScan = tick;
         printWaitTicks = 0;
         InteractionGate.setBusy(false);
@@ -544,6 +553,21 @@ public final class FeederController {
         long total = 0;
         for (LitematicaBridge.Need need : needs) total += need.target();
         return total;
+    }
+
+    /** 把缺口列表压成“物品×数量、物品×数量 等 N 种”，用于停止时的说明。 */
+    private static String describeNeeds(List<LitematicaBridge.Need> needs) {
+        StringBuilder text = new StringBuilder();
+        int shown = 0;
+        for (LitematicaBridge.Need need : needs) {
+            if (shown >= 3) break;
+            if (!(need.stack() instanceof ItemStack stack) || stack.isEmpty()) continue;
+            if (text.length() > 0) text.append("、");
+            text.append(stack.getName().getString()).append("×").append(need.deficit());
+            shown++;
+        }
+        if (needs.size() > shown) text.append(" 等 ").append(needs.size()).append(" 种");
+        return text.length() == 0 ? "未知原料" : text.toString();
     }
 
     private ContainerRef chooseContainer(List<LitematicaBridge.Need> deficits) {
@@ -988,9 +1012,16 @@ public final class FeederController {
             }
             if (currentTarget == null) currentTarget = chooseTarget();
             if (currentTarget == null) {
+                if (!targets.isEmpty() && ++idleTargetScans < 10) {
+                    // 还有待放置方块，只是都在冷却或次数用完：等一会儿再扫，别急着回中心。
+                    nextTargetScan = tick + 20;
+                    status = "等待可重试的打印目标";
+                    return;
+                }
                 afterTargetsExhausted();
                 return;
             }
+            idleTargetScans = 0;
         }
 
         if (currentTarget == null) {
@@ -1014,7 +1045,7 @@ public final class FeederController {
         if (result == Walker.Result.ARRIVED) {
             enablePrinter();
             // 打印机只在停留期间工作；即使配置成 0，也要留几 tick 让它真正放置。
-            printWaitTicks = Math.max(4, config.printWaitTicks);
+            printWaitTicks = Math.min(100, Math.max(4, config.printWaitTicks) + waitBonus);
             status = "等待打印机放置 " + currentTarget.toShortString();
         } else if (result == Walker.Result.FAILED) {
             targetAttempts.merge(currentTarget, 1, Integer::sum);
@@ -1178,14 +1209,25 @@ public final class FeederController {
         }
         if (missingBeforePrint >= 0 && missing >= missingBeforePrint) {
             noProgressCycles++;
+            // 没进展时下一轮多等一会儿，给打印机更多放置时间，而不是立刻判定放不上。
+            waitBonus = Math.min(MAX_WAIT_BONUS, Math.max(10, waitBonus * 2 + 10));
         } else {
             noProgressCycles = 0;
+            waitBonus = 0;
         }
         List<LitematicaBridge.Need> deficits = deficits(needs);
-        if (noProgressCycles >= 2 || (!hasUsefulMaterial() && chooseContainer(deficits) == null)) {
+        boolean canGetMaterial = hasUsefulMaterial() || chooseContainer(deficits) != null;
+        if (!canGetMaterial) {
             String extra = skipped.isEmpty() ? ""
                     : "；已跳过 " + skipped.size() + " 种容器里没有的原料";
-            finish("没有更多可打印的进度，停止在中心（剩余 " + missing + " 块）" + extra);
+            finish("剩余 " + missing + " 块，但背包和登记容器里都没有对应原料（"
+                    + describeNeeds(deficits) + "）" + extra + "。补料后按 F8 继续");
+            return;
+        }
+        if (noProgressCycles >= NO_PROGRESS_LIMIT) {
+            finish("连续 " + NO_PROGRESS_LIMIT + " 轮没有进展，停在中心（剩余 " + missing + " 块："
+                    + describeNeeds(deficits) + "）。原料还在，通常是打印机放不上："
+                    + "检查是否缺支撑、被遮挡，或超出打印机范围");
             return;
         }
         targets.clear();
@@ -1199,12 +1241,12 @@ public final class FeederController {
         status = "重新分析材料缺口";
     }
 
-    /** 背包里是否还有任何“清单缺口对应”的原料。 */
+    /** 背包里是否还有“剩余方块要用”的原料（不要求缺口数量还没被满足）。 */
     private boolean hasUsefulMaterial() {
         try {
             List<LitematicaBridge.Need> needs = bridge.needs(context, client.player);
             for (LitematicaBridge.Need need : needs) {
-                if (need.deficit() <= 0 || !(need.stack() instanceof ItemStack stack)) continue;
+                if (need.target() <= 0 || !(need.stack() instanceof ItemStack stack)) continue;
                 if (InventorySlots.countDirect(client.player, stack) > 0) return true;
             }
             return false;
