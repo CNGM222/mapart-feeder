@@ -60,6 +60,8 @@ public final class FeederController {
     }
 
     private static final int MAX_CLICKS_PER_TICK = 128;
+    /** 目标走不到或停留后仍未放上时，至少隔这么久再试。 */
+    private static final long TARGET_RETRY_COOLDOWN_TICKS = 200;
 
     private final MinecraftClient client;
     private final FeederConfig config;
@@ -96,6 +98,10 @@ public final class FeederController {
     /** 当前扫描到的、背包里有对应物品且尚未放置的方块。 */
     private final List<BlockPos> targets = new ArrayList<>();
     private final Map<BlockPos, Integer> targetAttempts = new HashMap<>();
+    /** 每个目标固定下来的接近点，避免走位途中接近点随玩家位置翻转。 */
+    private final Map<BlockPos, BlockPos> targetGoals = new HashMap<>();
+    /** 走不到或没放上去的目标，短暂跳过，避免在同一处反复来回。 */
+    private final Map<BlockPos, Long> targetCooldowns = new HashMap<>();
     private BlockPos currentTarget;
     private long nextTargetScan;
     private int printWaitTicks;
@@ -157,6 +163,8 @@ public final class FeederController {
         skipped.clear();
         targets.clear();
         targetAttempts.clear();
+        targetGoals.clear();
+        targetCooldowns.clear();
         currentTarget = null;
         noProgressCycles = 0;
         missingBeforePrint = -1;
@@ -201,6 +209,8 @@ public final class FeederController {
         cooldowns.clear();
         targets.clear();
         targetAttempts.clear();
+        targetGoals.clear();
+        targetCooldowns.clear();
         currentTarget = null;
         skipped.clear();
         taken.clear();
@@ -275,6 +285,8 @@ public final class FeederController {
         config.save();
         targets.clear();
         targetAttempts.clear();
+        targetGoals.clear();
+        targetCooldowns.clear();
         currentTarget = null;
         notice("地图画中心已设为 " + config.center.shortText());
     }
@@ -408,6 +420,8 @@ public final class FeederController {
             skipped.clear();
             targets.clear();
             targetAttempts.clear();
+            targetGoals.clear();
+            targetCooldowns.clear();
             currentTarget = null;
             noProgressCycles = 0;
         }
@@ -491,6 +505,8 @@ public final class FeederController {
         currentTarget = null;
         targets.clear();
         targetAttempts.clear();
+        targetGoals.clear();
+        targetCooldowns.clear();
         nextTargetScan = tick;
         printWaitTicks = 0;
         InteractionGate.setBusy(false);
@@ -939,16 +955,18 @@ public final class FeederController {
             return;
         }
         InteractionGate.setBusy(false);
-        // 打印机可能被它自己的自动关闭逻辑关掉，打印阶段持续校正。
-        if (tick % 20 == 0 && !printer.isPrintEnabled()) enablePrinter();
 
         if (printWaitTicks > 0) {
+            // 停留期间交给打印机放置；它自己的自动关闭逻辑可能会关掉打印模块，定期补开。
+            if (tick % 20 == 0 && !printer.isPrintEnabled()) enablePrinter();
             printWaitTicks--;
             if (printWaitTicks == 0) {
                 if (currentTarget != null && stillMissing(currentTarget)) {
-                    // 站了一会儿仍然没放上：记一次失败，换下一个目标，稍后还会回来。
+                    // 站了一会儿仍然没放上：记一次失败并短暂跳过，避免在同一处反复来回。
                     targetAttempts.merge(currentTarget, 1, Integer::sum);
+                    targetCooldowns.put(currentTarget, tick + TARGET_RETRY_COOLDOWN_TICKS);
                 }
+                if (currentTarget != null) targetGoals.remove(currentTarget);
                 currentTarget = null;
                 nextTargetScan = tick;
             }
@@ -958,7 +976,10 @@ public final class FeederController {
         if (tick >= nextTargetScan) {
             nextTargetScan = tick + 20;
             scanTargets();
-            if (currentTarget != null && !stillMissing(currentTarget)) currentTarget = null;
+            if (currentTarget != null && !stillMissing(currentTarget)) {
+                forgetTarget(currentTarget);
+                currentTarget = null;
+            }
             if (targets.isEmpty()) {
                 afterTargetsExhausted();
                 return;
@@ -975,34 +996,52 @@ public final class FeederController {
             return;
         }
         if (!stillMissing(currentTarget)) {
+            forgetTarget(currentTarget);
             currentTarget = null;
             nextTargetScan = tick;
             return;
         }
 
-        // 站在离目标约两格的位置，避免直接站在待放置方块上导致打印机放不进去；
-        // 第一次走不到时再改成直接走到方块坐标。
+        // 走路时关掉打印模块：打印机会持续把视角转向要放置的方块，
+        // 和走位方向抢视角，看起来就是原地打转。等站到目标旁再打开。
+        disablePrinterForTravel();
+
         int attempts = targetAttempts.getOrDefault(currentTarget, 0);
-        int offset = attempts == 0 ? 2 : 0;
-        int dx = Integer.compare(client.player.getBlockX(), currentTarget.getX());
-        int dz = Integer.compare(client.player.getBlockZ(), currentTarget.getZ());
-        if (dx == 0 && dz == 0) dx = 1;
-        int goalX = currentTarget.getX() + dx * offset;
-        int goalZ = currentTarget.getZ() + dz * offset;
-        Nav.PointGoal goal = new Nav.PointGoal(goalX, goalZ,
-                config.center.y - 2, config.center.y + 3, offset == 0 ? 1.2 : 1.0);
+        BlockPos goalPoint = targetGoals.computeIfAbsent(currentTarget,
+                pos -> approachPoint(pos, attempts));
+        Nav.PointGoal goal = new Nav.PointGoal(goalPoint.getX(), goalPoint.getZ(),
+                config.center.y - 2, config.center.y + 3, attempts == 0 ? 1.0 : 1.2);
         Walker.Result result = walker.tick(client, goal);
         if (result == Walker.Result.ARRIVED) {
-            printWaitTicks = config.printWaitTicks;
+            enablePrinter();
+            // 打印机只在停留期间工作；即使配置成 0，也要留几 tick 让它真正放置。
+            printWaitTicks = Math.max(4, config.printWaitTicks);
             status = "等待打印机放置 " + currentTarget.toShortString();
         } else if (result == Walker.Result.FAILED) {
             targetAttempts.merge(currentTarget, 1, Integer::sum);
+            targetCooldowns.put(currentTarget, tick + TARGET_RETRY_COOLDOWN_TICKS);
+            targetGoals.remove(currentTarget);
             currentTarget = null;
             nextTargetScan = tick;
-            status = "这个打印点走不到，换下一个";
+            status = "这个打印点走不到，先换下一个";
         } else {
             status = "前往未放置方块 " + currentTarget.toShortString();
         }
+    }
+
+    /** 第一次站在离目标两格的位置（不挡打印机），之后再走到方块旁边。 */
+    private BlockPos approachPoint(BlockPos target, int attempts) {
+        if (attempts > 0) return target.toImmutable();
+        int dx = Integer.compare(client.player.getBlockX(), target.getX());
+        int dz = Integer.compare(client.player.getBlockZ(), target.getZ());
+        if (dx == 0 && dz == 0) dx = 1;
+        return new BlockPos(target.getX() + dx * 2, target.getY(), target.getZ() + dz * 2);
+    }
+
+    private void forgetTarget(BlockPos pos) {
+        if (pos == null) return;
+        targetGoals.remove(pos);
+        targetCooldowns.remove(pos);
     }
 
     /** 只走到中心，不触发材料统计；用于结构区块未加载、需要靠近后再扫描的情况。 */
@@ -1051,6 +1090,9 @@ public final class FeederController {
                 targets.add(new BlockPos(x, y, z));
             }
         }
+        // 已经放好的方块不再保留接近点和冷却，避免状态越积越多。
+        targetGoals.keySet().retainAll(targets);
+        targetCooldowns.keySet().retainAll(targets);
     }
 
     private BlockPos chooseTarget() {
@@ -1060,6 +1102,8 @@ public final class FeederController {
         for (BlockPos pos : targets) {
             int attempts = targetAttempts.getOrDefault(pos, 0);
             if (attempts >= 3) continue;
+            Long cooldown = targetCooldowns.get(pos);
+            if (cooldown != null && cooldown > tick) continue;
             if (pos.equals(client.player.getBlockPos())) continue;
             double distance = feet.squaredDistanceTo(Vec3d.ofCenter(pos));
             if (distance < bestDistance) {
@@ -1078,7 +1122,7 @@ public final class FeederController {
         return required != client.world.getBlockState(pos);
     }
 
-    /** 当前范围内已经没有“能放置”的目标：判断是缺料还是结构没加载。 */
+    /** 一轮打印结束（当前范围已经没有可放置的目标）：按“取料 → 打印 → 中心刷新”循环回中心。 */
     private void afterTargetsExhausted() {
         List<LitematicaBridge.Need> needs = bridge.needs(context, client.player);
         long missing = missingTotal(needs);
@@ -1087,18 +1131,9 @@ public final class FeederController {
             status = "没有剩余方块，回中心确认";
             return;
         }
-        if (hasUsefulMaterial()) {
-            if (atCenter()) {
-                phase = Phase.TO_CENTER;
-                status = "中心也没有可放置目标，重新统计材料";
-            } else {
-                phase = Phase.TO_AREA;
-                status = "回到中心继续寻找未放置方块";
-            }
-            return;
-        }
+        // 每次都回中心刷新材料清单：只在这里统计才准确，刷新后再决定取料还是继续打印。
         phase = Phase.TO_CENTER;
-        status = "背包原料用完，回中心刷新清单";
+        status = "一轮打印结束，回中心刷新材料清单";
     }
 
     private void travelToCenter() {
@@ -1156,6 +1191,8 @@ public final class FeederController {
         }
         targets.clear();
         targetAttempts.clear();
+        targetGoals.clear();
+        targetCooldowns.clear();
         currentTarget = null;
         nextTargetScan = tick;
         phase = Phase.ANALYZE;

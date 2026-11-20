@@ -42,9 +42,10 @@ public final class Walker {
     private int idleTicks;
     private int stalledTicks;
     private int forceJump;
-    private int nudgeTicks;
-    private Vec3d nudgeDone;
+    private int stallJumps;
     private int routeMisses;
+    private int noProgressTicks;
+    private Vec3d lastPosition;
 
     private boolean movementOwned;
     private boolean smoothTurning = true;
@@ -97,7 +98,9 @@ public final class Walker {
         idleTicks = 0;
         stallRepaths = 0;
         stalledTicks = 0;
-        nudgeDone = null;
+        stallJumps = 0;
+        noProgressTicks = 0;
+        lastPosition = null;
         path.clear();
         path.addAll(route);
         // 路径的第一个点是出发格中心，玩家可能已经站在格子边缘；
@@ -178,38 +181,40 @@ public final class Walker {
         ownKeys(client);
         client.options.forwardKey.setPressed(true);
 
-        // 前方需要上台阶时在贴近方块的那一刻起跳；卡住自救也会强制起跳。
+        // 前方需要上台阶时在贴近方块的那一刻起跳；太远的台阶跳了也没用。
         boolean stepAhead = false;
         double nearestStep = Double.MAX_VALUE;
         int limit = Math.min(path.size() - 1, passIndex + 12);
         for (int i = passIndex; i <= limit; i++) {
             Vec3d point = path.get(i);
             if (point.y <= feet.y + 0.55) continue;
-            double distanceSq = horizontalSq(feet, point);
             stepAhead = true;
-            nearestStep = Math.min(nearestStep, Math.sqrt(distanceSq));
+            nearestStep = Math.min(nearestStep, Math.sqrt(horizontalSq(feet, point)));
         }
         boolean wantJump = forceJump > 0
-                || (stepAhead && (client.player.horizontalCollision || nearestStep < 0.75));
+                || (stepAhead && nearestStep < 1.3
+                && (client.player.horizontalCollision || nearestStep < 0.6));
         client.options.jumpKey.setPressed(wantJump && client.player.isOnGround());
         if (forceJump > 0) forceJump--;
 
-        if (nudgeTicks > 0) {
-            nudgeTicks--;
-            boolean left = (nudgeTicks / 5) % 2 == 0;
-            client.options.leftKey.setPressed(left);
-            client.options.rightKey.setPressed(!left);
+        // 连续两秒半几乎没有位移就放弃这个目标，避免一直原地起跳、转圈。
+        if (lastPosition != null && horizontalSq(feet, lastPosition) < 0.0025) {
+            noProgressTicks++;
         } else {
-            client.options.leftKey.setPressed(false);
-            client.options.rightKey.setPressed(false);
+            noProgressTicks = 0;
+        }
+        lastPosition = feet;
+        if (noProgressTicks > 50) {
+            release(client);
+            return Result.FAILED;
         }
 
         if (stalledTicks > STALL_TICKS) {
             stalledTicks = 0;
-            forceJump = 12;
-            if (nudgeTicks <= 0 && (nudgeDone == null || horizontalSq(feet, nudgeDone) > 1.0)) {
-                nudgeDone = feet;
-                nudgeTicks = 16;
+            // 只有台阶就在眼前时才用起跳自救；平地上顶着墙跳没有意义。
+            if (stepAhead && nearestStep < 1.3 && stallJumps < 2) {
+                stallJumps++;
+                forceJump = 10;
                 return Result.RUNNING;
             }
             if (++stallRepaths > MAX_STALL_REPATHS) {
@@ -218,13 +223,27 @@ public final class Walker {
             }
             path.clear();
             routeAge = REPATH_INTERVAL_TICKS;
+            noProgressTicks = 0;
         }
         return Result.RUNNING;
     }
 
-    /** 推进“已走过”的路点；返回是否有进展。 */
+    /** 推进“已走过”的路点；拐弯时被切掉的路点也会跳过，避免误判卡住。 */
     private boolean advancePass(Vec3d feet) {
         int before = passIndex;
+        int limit = Math.min(path.size() - 1, passIndex + 4);
+        int nearest = passIndex;
+        double nearestDistance = horizontalSq(feet, path.get(passIndex));
+        for (int i = passIndex + 1; i <= limit; i++) {
+            double distance = horizontalSq(feet, path.get(i));
+            if (distance < nearestDistance - 1.0E-6) {
+                nearestDistance = distance;
+                nearest = i;
+            }
+        }
+        if (nearest > passIndex && nearestDistance <= 0.49) {
+            passIndex = nearest;
+        }
         while (passIndex < path.size() - 1) {
             if (horizontalSq(feet, path.get(passIndex)) > PASS_RADIUS * PASS_RADIUS) break;
             passIndex++;
@@ -262,8 +281,9 @@ public final class Walker {
         stallRepaths = 0;
         idleTicks = 0;
         stalledTicks = 0;
-        nudgeTicks = 0;
-        nudgeDone = null;
+        stallJumps = 0;
+        noProgressTicks = 0;
+        lastPosition = null;
         forceJump = 0;
     }
 
@@ -293,7 +313,6 @@ public final class Walker {
         client.options.sprintKey.setPressed(savedSprint);
         client.options.leftKey.setPressed(savedLeft);
         client.options.rightKey.setPressed(savedRight);
-        nudgeTicks = 0;
     }
 
     private static double horizontalSq(Vec3d a, Vec3d b) {
