@@ -44,6 +44,7 @@ public final class Walker {
     private int forceJump;
     private int nudgeTicks;
     private Vec3d nudgeDone;
+    private int routeMisses;
 
     private boolean movementOwned;
     private boolean smoothTurning = true;
@@ -60,6 +61,7 @@ public final class Walker {
             return Result.FAILED;
         }
         if (Nav.isAtGoal(client, goal)) {
+            routeMisses = 0;
             release(client);
             resetRoute();
             return Result.ARRIVED;
@@ -67,6 +69,7 @@ public final class Walker {
         // 目标换了就必须丢掉旧路线，否则会继续朝上一个目标走一段时间，看起来像来回折返。
         if (lastGoal == null || !lastGoal.equals(goal)) {
             lastGoal = goal;
+            routeMisses = 0;
             resetRoute();
         }
         if (path.isEmpty() || routeAge++ > REPATH_INTERVAL_TICKS || needsRepath(client)) {
@@ -134,9 +137,19 @@ public final class Walker {
 
         Vec3d last = path.get(path.size() - 1);
         if (passIndex >= path.size() - 1 && horizontalSq(feet, last) < ARRIVE_RADIUS * ARRIVE_RADIUS) {
+            if (Nav.isAtGoal(client, goal)) {
+                release(client);
+                resetRoute();
+                return Result.ARRIVED;
+            }
+            // 路走完了却没满足目标：偶尔重走一次，连续几次都这样说明这个目标到不了。
+            if (++routeMisses >= 4) {
+                release(client);
+                return Result.FAILED;
+            }
             release(client);
             resetRoute();
-            return Nav.isAtGoal(client, goal) ? Result.ARRIVED : Result.RUNNING;
+            return Result.RUNNING;
         }
 
         int aim = chooseAim(client, feet);
