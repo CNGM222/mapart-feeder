@@ -955,6 +955,8 @@ public final class FeederController {
             return;
         }
         InteractionGate.setBusy(false);
+        // 打印机可能被它自己的自动关闭逻辑关掉，打印阶段持续校正。
+        if (tick % 20 == 0 && !printer.isPrintEnabled()) enablePrinter();
 
         if (printWaitTicks > 0) {
             // 停留期间交给打印机放置；它自己的自动关闭逻辑可能会关掉打印模块，定期补开。
@@ -1002,10 +1004,7 @@ public final class FeederController {
             return;
         }
 
-        // 走路时关掉打印模块：打印机会持续把视角转向要放置的方块，
-        // 和走位方向抢视角，看起来就是原地打转。等站到目标旁再打开。
-        disablePrinterForTravel();
-
+        // 瞄准点固定在选定目标时确定，走位途中不会翻到目标另一侧。
         int attempts = targetAttempts.getOrDefault(currentTarget, 0);
         BlockPos goalPoint = targetGoals.computeIfAbsent(currentTarget,
                 pos -> approachPoint(pos, attempts));
